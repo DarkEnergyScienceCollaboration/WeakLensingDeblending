@@ -16,7 +16,6 @@ import descwl.model
 from distutils.version import LooseVersion
 
 from six import iteritems
-
 def grl_equilibration(fish):
     """Algorithm for equilibrating fisher matrices of any shape. This is useful when inverting fisher matrices that have particularly high condition number.
 
@@ -66,11 +65,11 @@ class OverlapResults(object):
         bounds(array): Array of galsim.BoundsI objects giving pixel coordinates of
             each datacube in the full simulated image. Might be None.
         num_slices(int): Number of datacube slices for each stamp. Ignored if stamps is None.
-
+        is_star(bool): True if the object is a star.
     Raises:
         RuntimeError: Image datacubes have unexpected number of slices.
     """
-    def __init__(self,survey,table,stamps,bounds,num_slices):
+    def __init__(self,survey,table,stamps,bounds,num_slices,is_star):
         self.survey = survey
         self.table = table
         if self.table is not None:
@@ -79,9 +78,10 @@ class OverlapResults(object):
         self.stamps = stamps
         self.bounds = bounds
         self.num_slices = num_slices
+        self.is_star = is_star
         if len(self.stamps) > 0:
              #The '21' immediately below refers to the case when second partials are required (21 is 1 + 5 + 15, where the first term refers to the galaxy image itself, the 5 is the number of first partials excluding flux and 15 is the number of second partials excluding flux and using that partial derivatives commute.)
-            if self.num_slices not in (1,len(self.slice_labels), 21):
+            if self.num_slices not in (1, 3, 6, 21):
                 raise RuntimeError('Image datacubes have unexpected number of slices (%d).'
                     % self.num_slices)
         self.noise_seed = None
@@ -249,8 +249,8 @@ class OverlapResults(object):
             RuntimeError: Invalid index1 or index2, or galaxies are not contained with the
                 background image, or no partial derivative images are available.
         """
-        npar = len(self.slice_labels) #this are the actual number of partials
-        if self.num_slices != len(self.slice_labels) and self.num_slices != 21:
+        #npar = len(self.slice_labels) #this are the actual number of partials
+        if self.num_slices not in (3, 6, 21):
             raise RuntimeError('No partial derivative images are available.')
         # Calculate the overlap bounds.
         try:
@@ -265,16 +265,19 @@ class OverlapResults(object):
         # Is there any overlap between the two galaxies?
         if overlap.area() == 0:
             return None,None
-        product = self.get_stamp(index1,0)[overlap]*self.get_stamp(index2,0)[overlap]
+        product = self.get_stamp(index1, 0)[overlap]*self.get_stamp(index2, 0)[overlap]
         if not np.any(product.array):
-            return None,None
+            return None, None
         # Fill arrays of partial derivatives within the overlap region.
         width = overlap.xmax - overlap.xmin + 1
         height = overlap.ymax - overlap.ymin + 1
-        partials1 = np.empty((npar,height,width),dtype = np.float32)
-        partials2 = np.empty((npar,height,width),dtype = np.float32)
-        for islice in range(npar):
+        npar1 = 3 if self.is_star[index1] else 6
+        npar2 = 3 if self.is_star[index2] else 6
+        partials1 = np.empty((npar1, height, width),dtype = np.float32)
+        partials2 = np.empty((npar2, height, width),dtype = np.float32)
+        for islice in range(npar1):
             partials1[islice] = self.get_stamp(index1,islice)[overlap].array
+        for islice in range(npar2):
             partials2[islice] = self.get_stamp(index2,islice)[overlap].array
         partials1[0] /= self.table['flux'][index1]
         partials2[0] /= self.table['flux'][index2]
@@ -282,8 +285,8 @@ class OverlapResults(object):
         mu0 = background[overlap].array + self.survey.mean_sky_level
         fisher_norm = mu0**-1 + 0.5*mu0**-2
         # Calculate the Fisher images as the outer product of the partial-derivative images.
-        images = np.einsum('yx,iyx,jyx->ijyx',fisher_norm,partials1,partials2)
-        return images,overlap
+        images = np.einsum('yx,iyx,jyx->ijyx',fisher_norm, partials1, partials2)
+        return images, overlap
 
 
     def get_bias_tensor_images(self,index1,index2,background):
@@ -471,30 +474,43 @@ class OverlapResults(object):
         """
         background = self.get_subimage(selected)
         nsel = len(selected)
-        npar = len(self.slice_labels)
-        nfisher = nsel*npar
-        fisher = np.zeros((nfisher,nfisher),dtype = np.float64)
-        for row,index1 in enumerate(selected):
-            for col,index2 in enumerate(selected[:row+1]):
-                images,overlap = self.get_fisher_images(index1,index2,background)
+        npar = []
+        for i, idx in enumerate(selected):
+             if self.is_star[idx]:
+                 npar.append(3)
+             else:
+                 npar.append(len(self.slice_labels))
+        nfisher = np.sum(npar)
+        fisher = np.zeros((nfisher, nfisher), dtype=np.float64)
+        i0 = 0
+        i1 = 0
+        for row, index1 in enumerate(selected):
+            i1 += npar[row]
+            j0 = 0
+            j1 = 0
+            for col, index2 in enumerate(selected[:row+1]):
+                j0 = j1
+                j1+= npar[col]
+                images, overlap = self.get_fisher_images(index1, index2, background)
                 if overlap is None:
                     continue
-                fisher_sums = np.sum(images,axis=(2,3),dtype = np.float64)
-                fisher[npar*row:npar*(row+1),npar*col:npar*(col+1)] = fisher_sums
+                fisher_sums = np.sum(images, axis=(2, 3), dtype=np.float64)
+                fisher[i0:i1, j0:j1] = fisher_sums
                 if row != col:
-                    fisher[npar*col:npar*(col+1),npar*row:npar*(row+1)] = fisher_sums.T
-
+                    fisher[j0:j1, i0:i1] = fisher_sums.T
+            i0 = i1
         # Sort indices into the selected array by increasing snr_iso.
         priority = np.arange(nsel)[np.argsort(self.table['snr_iso'][selected])]
         # Start by trying to use all sources in the group.
-        keep = np.ones((nsel,npar),dtype=bool)
+        keep = np.ones(nfisher, dtype=bool)
         num_dropped = 0
+        idx0 = 0
+        idx1 = 0
         while np.any(keep):
             try:
                 keep_flat = keep.flatten()
                 # Advanced indexing like this makes a copy, not a view.
                 reduced_fisher = fisher[keep_flat,:][:,keep_flat]
-
                 if equilibrate: 
                     #equilibrate the fisher matrix.
                     ereduced_fisher = grl_equilibration(reduced_fisher)
@@ -505,59 +521,72 @@ class OverlapResults(object):
                 else: 
                     reduced_cond_num_grp = np.linalg.cond(reduced_fisher)
                     reduced_covariance = np.linalg.inv(reduced_fisher)
-
-
                 reduced_variance = np.diagonal(reduced_covariance).copy()
                 assert np.min(reduced_variance) > 0,'Expected variance > 0'
                 reduced_correlation = reduced_covariance/np.sqrt(
-                    np.outer(reduced_variance,reduced_variance))
+                    np.outer(reduced_variance, reduced_variance))
                 break
             except (np.linalg.LinAlgError, AssertionError) as e:
                 # We can't calculate a covariance for this set of objects, so drop the next
                 # lowest SNR member of the set and try again.
-                keep[priority[num_dropped],:] = False
+                idx1 += npar[priority[num_dropped]]
+                keep[idx0:idx1] = np.zeros(idx1-idx0, dtype=np.bool)
+                idx0 = idx1
                 num_dropped += 1
-
         if num_dropped == 0:
-            if get_cond_num: 
-                return (reduced_fisher, reduced_covariance,reduced_variance,reduced_correlation), reduced_cond_num_grp
-            else: 
-                return reduced_fisher, reduced_covariance,reduced_variance,reduced_correlation
+            if get_cond_num:
+                return (reduced_fisher, reduced_covariance, reduced_variance, reduced_correlation), reduced_cond_num_grp
+            else:
+                return reduced_fisher, reduced_covariance, reduced_variance, reduced_correlation
         else:
-            fisher = np.zeros((nfisher,nfisher),dtype = np.float64)
-            covariance = np.zeros((nfisher,nfisher),dtype = np.float64)
-            correlation = np.zeros((nfisher,nfisher),dtype = np.float64)
-            variance = np.empty((nfisher,),dtype = np.float64)
+            fisher = np.zeros((nfisher, nfisher), dtype=np.float64)
+            covariance = np.zeros((nfisher, nfisher), dtype=np.float64)
+            correlation = np.zeros((nfisher, nfisher), dtype=np.float64)
+            variance = np.empty((nfisher,), dtype=np.float64)
             variance[:] = np.inf
             # Build matrices with zeros for any sources that had to be dropped. Is there
             # a more elegant way to do this? We cannot simply assign to a submatrix
             # since that requires advancing slicing, which creates a copy, not a view.
-            keep_map = np.zeros(nsel,dtype=int)
-            keep_map[keep[:,0]] = np.arange(nsel-num_dropped)
+            keep_map = np.arange(nsel-num_dropped)
             next = 0
+            i0 = 0
+            i1 = 0
+            i0k = 0
+            i1k = 0
             for row in range(nsel):
-                if not keep[row,0]: continue
-                row_slice = slice(npar*row,npar*(row+1))
+                if not keep[i0]: continue
+                i1 += npar[row]
+                row_slice = slice(i0, i1)
                 krow = keep_map[row]
-                krow_slice = slice(npar*krow,npar*(krow+1))
+                i1k += npar[krow]
+                krow_slice = slice(i0k, i1k)
                 variance[row_slice] = reduced_variance[krow_slice]
+                j0 = 0
+                j1 = 0
+                j0k = 0
+                j1k = 0
                 for col in range(row+1):
-                    if not keep[col,0]: continue
-                    col_slice = slice(npar*col,npar*(col+1))
+                    j1 += npar[col]
+                    if not keep[j0]: continue
+                    col_slice = slice(j0, j1)
                     kcol = keep_map[col]
-                    kcol_slice = slice(npar*kcol,npar*(kcol+1))
-                    fisher[row_slice,col_slice] = reduced_fisher[krow_slice,kcol_slice]
-                    covariance[row_slice,col_slice] = reduced_covariance[krow_slice,kcol_slice]
-                    correlation[row_slice,col_slice] = reduced_correlation[krow_slice,kcol_slice]
+                    j1k += npar[kcol]
+                    kcol_slice = slice(j0k, j1k)
+                    fisher[row_slice, col_slice] = reduced_fisher[krow_slice, kcol_slice]
+                    covariance[row_slice, col_slice] = reduced_covariance[krow_slice, kcol_slice]
+                    correlation[row_slice, col_slice] = reduced_correlation[krow_slice, kcol_slice]
                     if row == col: continue
-                    fisher[col_slice,row_slice] = reduced_fisher[kcol_slice,krow_slice]
-                    covariance[col_slice,row_slice] = reduced_covariance[kcol_slice,krow_slice]
-                    correlation[col_slice,row_slice] = reduced_correlation[kcol_slice,krow_slice]
-
+                    fisher[col_slice, row_slice] = reduced_fisher[kcol_slice, krow_slice]
+                    covariance[col_slice, row_slice] = reduced_covariance[kcol_slice, krow_slice]
+                    correlation[col_slice, row_slice] = reduced_correlation[kcol_slice, krow_slice]
+                    j0 = j1
+                    j0k = j1k
+                i0 = i1
+                i0k = i1k
             if get_cond_num: 
-                return (fisher,covariance,variance,correlation), reduced_cond_num_grp
+                return (fisher, covariance, variance, correlation), reduced_cond_num_grp
             else: 
-                return fisher,covariance,variance,correlation
+                return fisher, covariance, variance, correlation
 
 
     def match_sextractor(self,catalog_name,column_name = 'match'):
@@ -621,6 +650,7 @@ class OverlapAnalyzer(object):
         self.models = [ ]
         self.stamps = [ ]
         self.bounds = [ ]
+        self.is_star = [ ]
         self.alpha = alpha
         self.no_hsm = no_hsm
         self.no_lmfit = no_lmfit
@@ -643,6 +673,7 @@ class OverlapAnalyzer(object):
         self.models.append(model)
         self.stamps.append(stamps)
         self.bounds.append(bounds)
+        self.is_star.append(False)
 
     def add_star(self,model,stamps,bounds):
         """
@@ -655,6 +686,7 @@ class OverlapAnalyzer(object):
         self.models.append(model)
         self.stamps.append(stamps)
         self.bounds.append(bounds)
+        self.is_star.append(True)
 
     def fit_galaxies(self,indices,observed_image,fixed_parameters = None):
         """Simultaneously fit a set of galaxy parameters to an observed image.
@@ -874,7 +906,8 @@ class OverlapAnalyzer(object):
                 ('psf_sigm',np.float32),
                 # Pixel-level properties.
                 ('purity',np.float32),
-                ('snr_sky',np.float32)
+                ('snr_sky',np.float32),
+                ('is_star', np.bool)
             ]
 
         #from here on, only add relevant entries. 
@@ -935,7 +968,7 @@ class OverlapAnalyzer(object):
             table = astropy.table.Table(data, copy=False)
             num_slices, h, w = self.stamps[0].shape
             results = OverlapResults(self.survey, table, self.stamps,
-                                     self.bounds, num_slices)
+                                     self.bounds, num_slices, self.is_star)
             return results
 
         trace('allocated table of %ld bytes for %d galaxies' % (data.nbytes,num_galaxies))
@@ -1036,9 +1069,9 @@ class OverlapAnalyzer(object):
 
         # Initialize our results object so we can use its methods (but be careful not
         # to use a method that needs something in table that we have not filled in yet).
-        table = astropy.table.Table(data,copy = False)
-        num_slices,h,w = self.stamps[0].shape
-        results = OverlapResults(self.survey,table,self.stamps,self.bounds,num_slices)
+        table = astropy.table.Table(data, copy = False)
+        num_slices, h, w = self.stamps[0].shape
+        results = OverlapResults(self.survey, table, self.stamps, self.bounds, num_slices, self.is_star)
 
 
         sky = self.survey.mean_sky_level
@@ -1059,14 +1092,13 @@ class OverlapAnalyzer(object):
 
             if not self.no_fisher:
                 # Check that we have partial derivatives available.
-                if num_slices != len(results.slice_labels) and num_slices != 21:
+                if num_slices not in (3, 6, 21):
                     raise RuntimeError('Missing required partial derivative images for Fisher matrix analysis.')
 
                 (fisher,covariance,variance,correlation), cond_num_grp = results.get_matrices(group_indices, get_cond_num=True, equilibrate=self.equilibrate)
-
                 if self.calculate_bias:
                     bias = results.get_bias(group_indices, covariance.copy())
-
+            base = 0
             for index,galaxy in enumerate(group_indices):
                 flux = data['flux'][galaxy]
                 signal = results.get_stamp(galaxy)
@@ -1107,20 +1139,20 @@ class OverlapAnalyzer(object):
                 # Calculate the SNR this galaxy would have without any overlaps and
                 # assuming that we are in the sky-dominated limit.
                 data['snr_sky'][galaxy] = np.sqrt(np.sum(signal.array**2)/sky)
-
                 # Calculate this galaxy's SNR in various ways.
-                base = index*len(results.slice_labels) #number of first partials
+                
                 if not self.no_fisher:
                     data['snr_grp'][galaxy] = flux*np.sqrt(fisher[base+dflux_index,base+dflux_index])
                     # Variances will be np.inf if this galaxy was dropped from the group for the
                     # covariance calculation, leading to snr_grpf = 0 and infinite errors on s,g1,g2.
                     data['snr_grpf'][galaxy] = flux/np.sqrt(variance[base+dflux_index])
-                    data['ds_grp'][galaxy] = np.sqrt(variance[base+ds_index])
-                    data['dg1_grp'][galaxy] = np.sqrt(variance[base+dg1_index])
-                    data['dg2_grp'][galaxy] = np.sqrt(variance[base+dg2_index])
+                    if not self.is_star[galaxy]:
+                        data['ds_grp'][galaxy] = np.sqrt(variance[base+ds_index])
+                        data['dg1_grp'][galaxy] = np.sqrt(variance[base+dg1_index])
+                        data['dg2_grp'][galaxy] = np.sqrt(variance[base+dg2_index])
                     data['cond_num_grp'][galaxy] = cond_num_grp #add calculated condition number for galaxy's group.
 
-                    if self.calculate_bias:
+                    if self.calculate_bias and not self.is_star[galaxy]:
                         data['bias_f_grp'][galaxy] = bias[base+dflux_index]
                         data['bias_s_grp'][galaxy] = bias[base+ds_index]
                         data['bias_g1_grp'][galaxy] = bias[base+dg1_index]
@@ -1131,12 +1163,13 @@ class OverlapAnalyzer(object):
                     if grp_size == 1:
                         data['snr_iso'][galaxy] = data['snr_grp'][galaxy]
                         data['snr_isof'][galaxy] = data['snr_grpf'][galaxy]
-                        data['ds'][galaxy] = data['ds_grp'][galaxy]
-                        data['dg1'][galaxy] = data['dg1_grp'][galaxy]
-                        data['dg2'][galaxy] = data['dg2_grp'][galaxy]
+                        if not self.is_star[galaxy]:
+                            data['ds'][galaxy] = data['ds_grp'][galaxy]
+                            data['dg1'][galaxy] = data['dg1_grp'][galaxy]
+                            data['dg2'][galaxy] = data['dg2_grp'][galaxy]
                         data['cond_num'][galaxy] = data['cond_num_grp'][galaxy]
 
-                        if self.calculate_bias:
+                        if self.calculate_bias and not self.is_star[galaxy]:
                             data['bias_f'][galaxy] = data['bias_f_grp'][galaxy]
                             data['bias_s'][galaxy] = data['bias_s_grp'][galaxy]
                             data['bias_g1'][galaxy] = data['bias_g1_grp'][galaxy]
@@ -1152,12 +1185,13 @@ class OverlapAnalyzer(object):
                         # yields any negative variances. Errors on s,g1,g2 will be np.inf.
                         data['snr_iso'][galaxy] = flux*np.sqrt(iso_fisher[dflux_index,dflux_index])
                         data['snr_isof'][galaxy] = flux/np.sqrt(iso_variance[dflux_index])
-                        data['ds'][galaxy] = np.sqrt(iso_variance[ds_index])
-                        data['dg1'][galaxy] = np.sqrt(iso_variance[dg1_index])
-                        data['dg2'][galaxy] = np.sqrt(iso_variance[dg2_index])
+                        if not self.is_star[galaxy]:
+                            data['ds'][galaxy] = np.sqrt(iso_variance[ds_index])
+                            data['dg1'][galaxy] = np.sqrt(iso_variance[dg1_index])
+                            data['dg2'][galaxy] = np.sqrt(iso_variance[dg2_index])
                         data['cond_num'][galaxy] = cond_num
 
-                        if self.calculate_bias:
+                        if self.calculate_bias and not self.is_star[galaxy]:
                             iso_bias = results.get_bias([galaxy], iso_covariance.copy())
                             data['bias_f'][galaxy] = iso_bias[dflux_index]
                             data['bias_s'][galaxy] = iso_bias[ds_index]
@@ -1165,7 +1199,10 @@ class OverlapAnalyzer(object):
                             data['bias_g2'][galaxy] = iso_bias[dg2_index]
                             data['bias_x'][galaxy] = iso_bias[dx_index]
                             data['bias_y'][galaxy] = iso_bias[dy_index]
-
+                if self.is_star[galaxy]:
+                    base += 3
+                else:
+                    base += len(results.slice_labels)
             # Order group members by decreasing isolated S/N (if available), otherwise use snr_sky.
             #this assumes that snr_sky is close to snr_iso (although not necessarily the same.)
             if not self.no_fisher:

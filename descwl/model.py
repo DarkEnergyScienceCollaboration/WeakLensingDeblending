@@ -417,8 +417,6 @@ class Star(object):
                 the requested transforms applied.
         """
         return (self.profile
-            .dilate(1 + ds)
-            .shear(g1 = dg1,g2 = dg2)
             .shift(dx = self.dx_arcsecs + dx,dy = self.dy_arcsecs + dy))
 
 class StarBuilder(object):
